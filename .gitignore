@@ -1,0 +1,12 @@
+# Ignore all pickle files
+*.pkl
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore database files
+*.db
+.venv
