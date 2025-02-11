@@ -313,4 +313,4 @@ def _train_model_and_send_success(ticker):
 if __name__ == "__main__":
     import uvicorn
     # pipeline.run_pipeline() #create ticker table
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
