@@ -1,6 +1,4 @@
-Here's the updated README with **Dockerization** for the cloud version:  
 
----
 
 # 📈 Automated Stock Forecasting Platform  
 
@@ -124,5 +122,3 @@ Contributions are welcome! Feel free to submit a pull request.
 This project is licensed under the **MIT License**.  
 
 ---
-
-This version includes **Dockerization** for the cloud deployment. Let me know if you'd like any modifications! 🚀😊
