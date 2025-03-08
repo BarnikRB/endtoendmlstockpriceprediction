@@ -6,17 +6,12 @@ import os
 import pickle
 from datetime import datetime, timedelta, date
 import sys
-import traceback
+import sqlite3
 from typing import List
-from supabase import Client, create_client
-from etl_pipeline.etls_class_postgres import StockDataPipeline
-from model_pipeline.model_trainer_cloud import StockModelTrainer
-from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables
+from etl_pipeline.etl_class_sqlite import StockDataPipeline
+from model_pipeline.model_trainer import StockModelTrainer
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # Setup Logger
 logger = logging.getLogger("fastapi")
 logger.setLevel(logging.INFO)
@@ -30,17 +25,12 @@ if not logger.handlers:
 
 app = FastAPI()
 
-
-
 # Database and trainer config
-supabase_config = {
-        "url": SUPABASE_URL,  
-        "key": SUPABASE_KEY # e.g., "your_anon_key"
-    }
-db_client : Client  = create_client(supabase_url=supabase_config["url"],supabase_key=supabase_config['key'])
-pipeline = StockDataPipeline(supabase_client=db_client)
+DATABASE_PATH = "./data/stock_data.db"
+local_db_config = {"database": DATABASE_PATH}
 
-trainer = StockModelTrainer()
+pipeline = StockDataPipeline("local", local_db_config)
+trainer = StockModelTrainer(DATABASE_PATH)
 
 
 class PredictionRequest(BaseModel):
@@ -59,12 +49,12 @@ async def predict(request: PredictionRequest):
     ticker = request.ticker.lower()
     logger.info(f"Prediction requested for ticker: {ticker}")
     try:
-        model_path = trainer._get_latest_model_path(ticker)
+        model_path = _get_latest_model_path(ticker)
         if not model_path:
            raise HTTPException(status_code=404, detail="Model not found for this ticker")
         
-        
-        model = trainer._download_model_from_gcs(model_filename=model_path)
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
         
         last_data = _get_last_datapoints(ticker)
         if last_data is None:
@@ -73,8 +63,7 @@ async def predict(request: PredictionRequest):
         return {"ticker": ticker, "predictions": predictions}
 
     except Exception as e:
-        tb_str = traceback.format_exc()
-        logger.error(f"Error during prediction for {ticker}: {e}\n{tb_str}")
+        logger.error(f"Error during prediction for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
 
 @app.post("/add", status_code=200)
@@ -83,8 +72,8 @@ async def add_ticker(request:AddTickerRequest):
    logger.info(f"Add Ticker request for: {ticker}")
    if not pipeline.add_new_ticker(ticker):
       raise HTTPException(status_code=400, detail=f"Failed to add Ticker or Ticker already exists")
-   df = pipeline.return_ticker_data(ticker=ticker)
-   success = _train_model_and_send_success(ticker,df)
+   
+   success = _train_model_and_send_success(ticker)
    if success:
        return {"message": f"Ticker {ticker} added and model trained successfully"}
    else:
@@ -93,11 +82,22 @@ async def add_ticker(request:AddTickerRequest):
 @app.get("/tickers", response_model=List[str])
 async def get_tickers():
     """Endpoint to get all available tickers"""
-   
-
-    tickers = pipeline._get_tickers_from_db()
-    logging.debug(f"Tickers fetched from database: {tickers}")
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    # cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    # tables = cursor.fetchall()
+    # conn.close()
+    # tickers = [table[0] for table in tables if table[0] != "sqlite_sequence"] #remove the metadata table
+    tab_name = 'tickers'
+    query = f"SELECT ticker, currency FROM {tab_name};"
+    logging.debug(f"Executing SQL query: {query}")  # Log the query
+    # self._get_database_connection()
     
+    cursor.execute(query)
+    tickers = cursor.fetchall()
+    logging.debug(f"Tickers fetched from database: {tickers}")
+    tickers = [x[0] for x in tickers]
+    conn.close()
     return tickers
 
 @app.get("/historical_data/{ticker}", response_model=HistoricalDataResponse)
@@ -107,23 +107,22 @@ async def get_historical_data(ticker: str):
     try:
         today = datetime.today()
         one_month_ago = today - timedelta(days=30)
-    
-        df = pipeline.return_ticker_data(ticker=ticker)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df[(df['date'] >= one_month_ago) & (df['date'] <= today)]
+        query = f"SELECT Date, Close FROM \"{ticker}\" WHERE Date >= ? AND Date <= ? ORDER BY Date ASC"
+        conn = sqlite3.connect(DATABASE_PATH)
+        df = pd.read_sql_query(query, conn, parse_dates=['Date'], params=(one_month_ago, today))
+        conn.close()
 
         if df.empty:
             logger.warning(f"No data found in database for last month for {ticker}")
             return HistoricalDataResponse(dates=[], close=[])
         
-        dates = df['date'].dt.strftime('%Y-%m-%d').tolist()
-        close = df['close'].tolist()
+        dates = df['Date'].dt.strftime('%Y-%m-%d').tolist()
+        close = df['Close'].tolist()
         return HistoricalDataResponse(dates=dates, close=close)
 
     except Exception as e:
-        tb_str = traceback.format_exc()
-        logger.error(f"Error during prediction for {ticker}: {e}\n{tb_str}")
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
+         logger.error(f"Error fetching historical data from db for {ticker}: {e}")
+         raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
 
 @app.post("/update_data", status_code=200)
 async def update_all_tickers_data():
@@ -149,9 +148,7 @@ async def retrain_all_models():
         
         for ticker in tickers:
             logger.info(f"Retraining model for {ticker}")
-            data = pipeline.return_ticker_data(ticker)
-            
-            success = _train_model_and_send_success(ticker,data)
+            success = _train_model_and_send_success(ticker)
             if not success:
                logger.warning(f"Failed to retrain model for {ticker}")
         
@@ -166,26 +163,25 @@ async def clean_database():
     """Endpoint to clean the entire database"""
     logger.info("Database cleaning initiated.")
     try:
-        # conn = sqlite3.connect(DATABASE_PATH)
-        # cursor = conn.cursor()
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
         
-        # # Delete all tables (except sqlite_sequence if needed)
-        # cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        # tables = cursor.fetchall()
+        # Delete all tables (except sqlite_sequence if needed)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
         
-        # for table in tables:
-        #    if table[0] != "sqlite_sequence":
-        #         cursor.execute(f"DROP TABLE IF EXISTS {table[0]};")
-        #         logger.info(f"Dropped Table {table[0]}")
+        for table in tables:
+           if table[0] != "sqlite_sequence":
+                cursor.execute(f"DROP TABLE IF EXISTS {table[0]};")
+                logger.info(f"Dropped Table {table[0]}")
         
-        # #Recreate the ticker table
-        # pipeline.create_ticker_table()
+        #Recreate the ticker table
+        pipeline.create_ticker_table()
         
-        # conn.commit()
-        # conn.close()
+        conn.commit()
+        conn.close()
         
-        # #Clean the models folder as well
-        pipeline.clean_database()
+        #Clean the models folder as well
         _clean_models_folder()
         
         return {"message": "Database cleaned successfully."}
@@ -199,18 +195,39 @@ async def clean_database():
 
 def _clean_models_folder():
     """Helper method to clean the model folder"""
-    
+    models_folder = "./models"
     try:
-        trainer._clean_everything()
+        if os.path.exists(models_folder):
+            for ticker_dir in os.listdir(models_folder):
+                ticker_path = os.path.join(models_folder, ticker_dir)
+                if os.path.isdir(ticker_path):
+                    for file in os.listdir(ticker_path):
+                        file_path = os.path.join(ticker_path,file)
+                        os.remove(file_path)
+                    os.rmdir(ticker_path)
+        logger.info(f"Cleaned the folder {models_folder} successfully")
     except Exception as e:
         logger.error(f"Error cleaning the models folder: {e}")
 
 
+def _get_latest_model_path(ticker):
+    """Helper method to find the latest model for a given ticker"""
+    ticker_folder = f"./models/{ticker}"
+    if not os.path.exists(ticker_folder):
+      return None
+    model_files = [f for f in os.listdir(ticker_folder) if f.endswith('.pkl')]
+    if not model_files:
+       return None
+    model_files.sort(reverse=True)
+    return os.path.join(ticker_folder, model_files[0])
 
 def _get_last_datapoints(ticker):
     """Helper method to fetch the last data points for the ticker"""
     try:
-        df = pipeline.return_ticker_data(ticker=ticker)
+        query = f"SELECT Date, Close FROM \"{ticker}\" ORDER BY Date DESC LIMIT 7"
+        conn = sqlite3.connect(DATABASE_PATH)
+        df = pd.read_sql_query(query, conn, parse_dates=['Date'], index_col='Date')
+        conn.close()
         if df.empty:
            logger.warning(f"No data found for ticker {ticker} to make predictions.")
            return None
@@ -228,16 +245,12 @@ def _make_autoregressive_predictions(model, last_data):
         return predictions
     
     last_data_copy = last_data.copy()
-    last_data_copy['date'] = pd.to_datetime(last_data_copy['date'])
-    last_data_copy = last_data_copy.set_index('date') 
-   
     all_data = last_data_copy.copy()
 
     for i in range(7):
-        # print(all_data.index[-1])
         next_date = all_data.index[-1] + timedelta(days=1)
         # Explicitly set each column to None
-        all_data.loc[next_date, 'close'] = None
+        all_data.loc[next_date, 'Close'] = None
         all_data.loc[next_date, 'day_of_week'] = None
         all_data.loc[next_date, 'month'] = None
         all_data.loc[next_date, 'day_of_year'] = None
@@ -257,23 +270,20 @@ def _make_autoregressive_predictions(model, last_data):
     
     # Create lag features
     for lag in range(1, 8):
-        all_data[f'lag_{lag}'] = all_data['close'].shift(lag)
+        all_data[f'lag_{lag}'] = all_data['Close'].shift(lag)
     
     # all_data.dropna(inplace=True)
     
     for i in range(7):
          # Select the data needed for this iteration.
         #The last row of the all_data represents the prediction that can be made
-        
         df_for_prediction = all_data.iloc[-(7 - i):].head(1).copy()
-        df_cop = df_for_prediction.copy()
+        
         if df_for_prediction.empty:
             logger.warning("No data remains to make prediction")
             break #if no data then exit loop
             
-        df_for_prediction = df_for_prediction.reset_index()
-        X = df_for_prediction.drop(['close','date','ticker'], axis=1)
-        # print(X.info())
+        X = df_for_prediction.drop('Close', axis=1)
         
         #Make prediction
         prediction_np = model.predict(X)[0]
@@ -285,14 +295,14 @@ def _make_autoregressive_predictions(model, last_data):
         # print(all_data)
 
         #Update the dataframe in place
-        all_data.loc[df_cop.index, "close"] = prediction
+        all_data.loc[df_for_prediction.index, "Close"] = prediction
     
     return predictions
 
-def _train_model_and_send_success(ticker,df):
+def _train_model_and_send_success(ticker):
     """Helper method to train model and return success or failure."""
     try:
-        trainer.train(ticker=ticker,df=df)
+        trainer.train(ticker)
         logger.info(f"Training model complete for: {ticker}")
         return True
     except Exception as e:
