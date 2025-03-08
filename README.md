@@ -21,7 +21,7 @@ An end-to-end machine learning pipeline for **automated stock price forecasting*
 ✅ **FastAPI Backend** – Serves predictions and stock data via a REST API.  
 ✅ **Streamlit Frontend** – Interactive UI for visualizing predictions and trends.  
 ✅ **Dual Deployment Support** –  
-   - **Local Version**: Uses **SQLite** and runs Airflow locally.  
+   - **Local Version**: Uses **SQLite** and runs Airflow locally (local_pipeline).  
    - **Cloud Version**: Uses **Supabase Postgres**, **Dockerized FastAPI**, and **Google Cloud Composer** for Airflow.  
 ✅ **Scalable Cloud Deployment** – GCP-based infrastructure for automated ML workflows.  
 
